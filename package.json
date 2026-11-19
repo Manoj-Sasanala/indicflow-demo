@@ -1,0 +1,14 @@
+{
+  "name": "indicflow-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser demo of the speech engine behind IndicFlow — Gnani AI Prisma STT with Hinglish and Indic language support.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "MIT"
+}

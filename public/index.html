@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IndicFlow — speech engine demo</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1015; --card:#181a22; --text:#f2f3f7; --muted:#9aa0b4; --accent:#7c3aed; --ok:#22c55e; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px;
+         background:var(--bg); color:var(--text);
+         font:16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { width:100%; max-width:640px; }
+  h1 { font-size:28px; margin:0 0 4px; letter-spacing:-0.5px; }
+  .sub { margin:0 0 24px; color:var(--muted); font-size:15px; }
+  .sub a { color:#a78bfa; }
+  .card { background:var(--card); border:1px solid #262a36; border-radius:14px; padding:20px; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  button { font:inherit; font-weight:600; border:0; border-radius:10px; padding:12px 22px; cursor:pointer;
+           background:var(--accent); color:#fff; }
+  button[disabled] { opacity:.5; cursor:progress; }
+  button.recording { background:#dc2626; }
+  select { font:inherit; padding:10px 12px; border-radius:10px; border:1px solid #333849;
+           background:#12141b; color:var(--text); }
+  #status { color:var(--muted); font-size:14px; min-height:20px; margin:14px 0 0; }
+  #out { margin:14px 0 0; padding:14px; border-radius:10px; background:#12141b; border:1px solid #262a36;
+         min-height:76px; white-space:pre-wrap; font:inherit; }
+  #out.empty { color:#5f667a; }
+  .meta { margin-top:10px; font-size:12px; color:#5f667a; }
+</style>
+</head>
+<body>
+<main>
+  <h1>IndicFlow</h1>
+  <p class="sub">
+    Web demo of the speech engine behind
+    <a href="https://github.com/Manoj-Sasanala/IndicFlow">IndicFlow</a>, a Windows voice-dictation app.
+    Speak English, Hindi or Hinglish — transcription comes from Gnani AI Prisma STT.
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <button id="rec" type="button">● Record</button>
+      <select id="lang" aria-label="Language">
+        <option value="en-IN">English (India)</option>
+        <option value="hi-IN">Hindi</option>
+        <option value="te-IN">Telugu</option>
+        <option value="ta-IN">Tamil</option>
+        <option value="kn-IN">Kannada</option>
+        <option value="mr-IN">Marathi</option>
+      </select>
+    </div>
+    <p id="status">Press Record, speak, then press Stop.</p>
+    <pre id="out" class="empty">Your transcript will appear here.</pre>
+    <p class="meta">Clips are capped at 6 MB and 6 requests per minute. Audio is sent only to Gnani for transcription.</p>
+  </div>
+</main>
+
+<script>
+'use strict';
+
+const recBtn = document.getElementById('rec');
+const langSel = document.getElementById('lang');
+const statusEl = document.getElementById('status');
+const outEl = document.getElementById('out');
+
+let ctx = null;
+let stream = null;
+let node = null;
+let sink = null;
+let buffers = [];
+let isRecording = false;
+let startedAt = 0;
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function setOutput(text) {
+  outEl.textContent = text || 'Your transcript will appear here.';
+  outEl.classList.toggle('empty', !text);
+}
+
+async function beginCapture() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  });
+  ctx = new AudioContext();
+  const source = ctx.createMediaStreamSource(stream);
+  node = ctx.createScriptProcessor(4096, 1, 1);
+  sink = ctx.createGain();
+  sink.gain.value = 0;
+  buffers = [];
+
+  node.onaudioprocess = (event) => {
+    buffers.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+  };
+
+  source.connect(node);
+  node.connect(sink);
+  sink.connect(ctx.destination);
+}
+
+function releaseCapture() {
+  if (node) {
+    node.onaudioprocess = null;
+    node.disconnect();
+  }
+  if (sink) sink.disconnect();
+  if (ctx) ctx.close().catch(() => {});
+  if (stream) stream.getTracks().forEach((track) => track.stop());
+  ctx = null;
+  node = null;
+  sink = null;
+  stream = null;
+}
+
+function mergeBuffers(chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+// Prisma wants 16 kHz mono; the browser gives us its own rate, so average down.
+function downsample(samples, fromRate, toRate) {
+  if (toRate >= fromRate) return samples;
+  const ratio = fromRate / toRate;
+  const outLength = Math.floor(samples.length / ratio);
+  const out = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(samples.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += samples[j];
+    out[i] = sum / Math.max(1, end - start);
+  }
+  return out;
+}
+
+function encodeWav(float32, sampleRate) {
+  const pcm = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  const dataSize = pcm.length * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const write = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  write(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  write(8, 'WAVE');
+  write(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  write(36, 'data');
+  view.setUint32(40, dataSize, true);
+  new Uint8Array(buffer, 44).set(new Uint8Array(pcm.buffer));
+  return buffer;
+}
+
+async function stopAndTranscribe() {
+  const sourceRate = ctx ? ctx.sampleRate : 48000;
+  const captured = mergeBuffers(buffers);
+  releaseCapture();
+
+  const seconds = captured.length / sourceRate;
+  if (seconds < 0.3) {
+    setStatus('Too short — hold the button a little longer.');
+    return;
+  }
+
+  const pcm16 = downsample(captured, sourceRate, 16000);
+  const wav = encodeWav(pcm16, 16000);
+
+  setStatus('Transcribing…');
+  recBtn.disabled = true;
+  try {
+    const res = await fetch(`/api/transcribe?lang=${encodeURIComponent(langSel.value)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'audio/wav' },
+      body: wav,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    setOutput(data.text || '(no speech detected)');
+    setStatus(`Done in ${((performance.now() - startedAt) / 1000).toFixed(1)}s · ${seconds.toFixed(1)}s of audio`);
+  } catch (err) {
+    setStatus(`Failed: ${err.message}`);
+  } finally {
+    recBtn.disabled = false;
+  }
+}
+
+recBtn.addEventListener('click', async () => {
+  if (isRecording) {
+    isRecording = false;
+    recBtn.classList.remove('recording');
+    recBtn.textContent = '● Record';
+    await stopAndTranscribe();
+    return;
+  }
+
+  setOutput('');
+  try {
+    await beginCapture();
+  } catch (err) {
+    setStatus(`Microphone unavailable: ${err.message}`);
+    return;
+  }
+  isRecording = true;
+  startedAt = performance.now();
+  recBtn.classList.add('recording');
+  recBtn.textContent = '■ Stop';
+  setStatus('Listening… speak now.');
+});
+</script>
+</body>
+</html>
